@@ -12,23 +12,24 @@
 
 using namespace tt::tt_metal;
 
-namespace ttnn::operations::sample {
+namespace ttnn::operations::grid_sample {
     using namespace tt::constants;
     operation::ProgramWithCallbacks sample_multi_core(
         const Tensor& input,
-        const Tensor& coords,
-        const Tensor& mask,
+        const Tensor& grid,
+        const uint32_t in_channels,
         const uint32_t in_height,
         const uint32_t in_width,
         const uint32_t out_height,
         const uint32_t out_width,
+        const bool align_corners,
         const Tensor& output){
 
             tt::tt_metal::Program program{};
             tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input.get_dtype());
             uint32_t input_unit_size = input.element_size();
-            tt::DataFormat grid_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(coords.get_dtype());
-            uint32_t grid_unit_size = coords.element_size();
+            tt::DataFormat grid_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(grid.get_dtype());
+            uint32_t grid_unit_size = grid.element_size();
 
             tt::DataFormat output_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.get_dtype());
             uint32_t output_unit_size = output.element_size();
@@ -49,17 +50,13 @@ namespace ttnn::operations::sample {
 
             const auto& input_shape = input.get_padded_shape();
 
-            const auto& grid_shape = coords.get_padded_shape();
-            const uint32_t num_coords = grid_shape[3];
+            const auto& grid_shape = grid.get_padded_shape();
+            const uint32_t num_grid = grid_shape[3];
 
             const auto& output_shape = output.get_padded_shape();
 
-            const uint32_t weight_shape = std::sqrt(num_coords/2);
-            const uint32_t stride_h = 1, stride_w = 1;
-            const uint32_t pad_h = 1, pad_w = 1;
-
             uint32_t src0_cb_index = tt::CBIndex::c_0;
-            uint32_t num_src0_units = input_shape[3];   // B*Hi*Wi
+            uint32_t num_src0_units = input_shape[3];   // HiWi
             uint32_t aligned_src0_unit_size = num_src0_units * input_unit_size;
             // total size and page size of a circular buffer is set to the same
             tt::tt_metal::CircularBufferConfig cb_src0_config =
@@ -68,7 +65,7 @@ namespace ttnn::operations::sample {
             auto cb_src0 = tt::tt_metal::CreateCircularBuffer(program, all_cores, cb_src0_config);
 
             uint32_t src1_cb_index = tt::CBIndex::c_1;
-            uint32_t num_src1_units = coords.volume();  // BHoWo*2
+            uint32_t num_src1_units = grid_shape[3];  // 2*K*K
             uint32_t aligned_src1_unit_size = num_src1_units * grid_unit_size;
             tt::tt_metal::CircularBufferConfig cb_src1_config =
                 tt::tt_metal::CircularBufferConfig(aligned_src1_unit_size, {{src1_cb_index, grid_cb_data_format}})
@@ -76,7 +73,7 @@ namespace ttnn::operations::sample {
             auto cb_src1 = tt::tt_metal::CreateCircularBuffer(program, all_cores, cb_src1_config);
 
             uint32_t out_cb_index = tt::CBIndex::c_16;
-            uint32_t num_out_units = output_shape[3];  // BHoWo
+            uint32_t num_out_units = output_shape[3];  // C*K*K
             uint32_t aligned_out_unit_size = num_out_units * output_unit_size;
             tt::tt_metal::CircularBufferConfig cb_out_config =
                 tt::tt_metal::CircularBufferConfig(aligned_out_unit_size, {{out_cb_index, output_cb_data_format}})
@@ -84,7 +81,7 @@ namespace ttnn::operations::sample {
             auto cb_out = tt::tt_metal::CreateCircularBuffer(program, all_cores, cb_out_config);
 
             auto src0_buffer = input.buffer();
-            auto src1_buffer = coords.buffer();
+            auto src1_buffer = grid.buffer();
             auto dst_buffer = output.buffer();
             bool src0_is_dram = src0_buffer->buffer_type() == tt::tt_metal::BufferType::DRAM ? 1 : 0;
             bool src1_is_dram = src1_buffer->buffer_type() == tt::tt_metal::BufferType::DRAM ? 1 : 0;
@@ -100,16 +97,12 @@ namespace ttnn::operations::sample {
                 aligned_src0_unit_size,
                 aligned_src1_unit_size,
                 aligned_out_unit_size,
-                output_unit_size,
+                in_channels,
                 in_height,
                 in_width,
                 out_height,
                 out_width,
-                stride_h,
-                stride_w,
-                pad_h,
-                pad_w,
-                weight_shape,
+                align_corners
             };
 
             tt::tt_metal::KernelHandle reader_kernel_id = tt::tt_metal::CreateKernel(
@@ -122,7 +115,7 @@ namespace ttnn::operations::sample {
                     .compile_args = reader_compile_time_args});
 
             auto cores = grid_to_cores(num_cores, num_cores_x, num_cores_y, false);
-            uint32_t num_sticks = input_shape[2];
+            uint32_t num_sticks = grid_shape[2];
             uint32_t num_sticks_per_core = num_sticks/num_cores;
             uint32_t num_sticks_per_core_remainder = num_sticks%num_cores;
             uint32_t start_id = 0;
@@ -133,7 +126,7 @@ namespace ttnn::operations::sample {
                     n_sticks_per_core++;
                 }
                 tt::tt_metal::SetRuntimeArgs(
-                    program, reader_kernel_id, core, 
+                    program, reader_kernel_id, core,
                     {src0_buffer->address(), src1_buffer->address(), dst_buffer->address(), start_id, n_sticks_per_core});
                 start_id += n_sticks_per_core;
             }

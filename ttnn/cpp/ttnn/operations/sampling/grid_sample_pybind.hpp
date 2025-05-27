@@ -6,7 +6,7 @@ namespace py = pybind11;
 
 namespace ttnn {
 namespace operations {
-namespace sample {
+namespace grid_sample {
 
 void py_module(py::module& module);
 

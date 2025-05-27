@@ -1,5 +1,5 @@
-#include "ttnn/operations/sampling/device/sample_op.hpp"
-#include "sample_program_factory.hpp"
+#include "ttnn/operations/sampling/device/grid_sample_op.hpp"
+#include "grid_sample_program_factory.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,22 +22,22 @@ using namespace tt::constants;
 using namespace tt::tt_metal;
 
 
-namespace ttnn::operations::sample{
+namespace ttnn::operations::grid_sample{
     void Sample::validate_with_output_tensors(
         const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-        TT_FATAL(input_tensors.size() == 3, "Must have 3 input tensors");
+        TT_FATAL(input_tensors.size() == 2, "Must have 2 input tensors");
         TT_FATAL(output_tensors.size() == 1, "Must have 1 output tensors");
 
         const auto& input_tensor = input_tensors[0];
-        const auto& coords_tensor = input_tensors[1];
+        const auto& grid_tensor = input_tensors[1];
         const auto& mask_tensor = input_tensors[2];
         const auto& optional_output_tensor = output_tensors.at(0);
 
         TT_FATAL(input_tensor.get_dtype() == DataType::BFLOAT16, "Only BFLOAT16 is supported for inputs!");
         TT_FATAL(input_tensor.get_layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR layout is supported for inputs!");
-        TT_FATAL(coords_tensor.get_dtype() == DataType::FLOAT32, "Only FLOAT32 is supported for grid because we can preserve accuracy!");
-        TT_FATAL(coords_tensor.get_layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR layout is supported for grid!");
-     
+        TT_FATAL(grid_tensor.get_dtype() == DataType::BFLOAT16, "Only BFLOAT16 is supported! Do not worry about data loss, we will cast it back to float32 later.");
+        TT_FATAL(grid_tensor.get_layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR layout is supported for grid!");
+
         if (optional_output_tensor.has_value()) {
             TT_FATAL(
                 optional_output_tensor.value().get_dtype() == DataType::BFLOAT16,
@@ -55,22 +55,18 @@ namespace ttnn::operations::sample{
         }
 
         const auto& input_tensor = input_tensors[0];
-        const auto& coords_tensor = input_tensors[1];
-        const auto& mask_tensor = input_tensors[2];
+        const auto& grid_tensor = input_tensors[1];
 
-        auto coord_shape = coords_tensor.get_padded_shape();    //1, 1, BHoWo, 2*weight_shape*weight_shape
-        TT_FATAL(coord_shape[0] == 1, "dim 0 must be 1");
-        TT_FATAL(coord_shape[1] == 1, "dim 1 must be 1");
+        auto grid_shape = grid_tensor.get_padded_shape();    //1, 1, BHoWo, 2
+        TT_FATAL(grid_shape[0] == 1, "dim 0 must be 1. In general, shape format for the grid should be (1, 1, B*H*W, 2)");
+        TT_FATAL(grid_shape[1] == 1, "dim 1 must be 1. In general, shape format for the grid should be (1, 1, B*H*W, 2)");
+        TT_FATAL(grid_shape[3] == 2, "The last dimension should contain only pixel coordinations (x, y)");
 
-        auto input_shape = input_tensor.get_padded_shape(); //1, 1, Ci, BHiWi
-        TT_FATAL(input_shape[0] == 1, "dim 0 must be 1");
-        TT_FATAL(input_shape[1] == 1, "dim 1 must be 1");
+        auto input_shape = input_tensor.get_padded_shape(); //1, 1, BHiWi, Ci
+        TT_FATAL(input_shape[0] == 1, "dim 0 must be 1. In general, shape format for the input should be (1, 1, B*H*W, C)");
+        TT_FATAL(input_shape[1] == 1, "dim 1 must be 1. In general, shape format for the input should be (1, 1, B*H*W, C)");
 
-        uint32_t n_coord = coord_shape[3];
-        uint32_t weight_shape = (int)(std::sqrt(n_coord/2));
-
-        // ttnn::SimpleShape output_shape({1, 1, input_shape[2]*weight_shape*weight_shape, coord_shape[2]});
-        ttnn::SimpleShape output_shape({1, 1, input_shape[2], coord_shape[3]/2});
+        ttnn::SimpleShape output_shape({1, 1, grid_shape[2], in_channels});
         // std::cout << "output shape: " << output_shape[0] << " " << output_shape[1] << " " << output_shape[2] << " " << output_shape[3] << std::endl;
         return {TensorSpec(output_shape, TensorLayout(output_dtype, PageConfig(input_tensor.get_layout()), output_mem_config))};
     }
@@ -88,10 +84,9 @@ namespace ttnn::operations::sample{
         const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const {
         const auto& input = input_tensors.at(0);
         const auto& coords = input_tensors.at(1);
-        const auto& mask = input_tensors.at(2);
         const auto& output_tensor = output_tensors.at(0);
-        return sample_multi_core(input, coords, mask, in_height, in_width, out_height, out_width, output_tensor);
+        return sample_multi_core(input, coords,
+            in_channels, in_height, in_width, out_height, out_width, align_corners,
+            output_tensor);
     }
 }
-
-
